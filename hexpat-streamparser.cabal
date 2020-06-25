@@ -1,0 +1,27 @@
+cabal-version: 1.12
+name: hexpat-streamparser
+version: 0.0.0.1
+maintainer: kristof@resonata.be
+copyright: Kristof Bastiaensen 2020
+license: BSD3
+license-file: LICENSE
+build-type: Simple
+
+source-repository head
+    type: git
+    location: https://github.com/kuribas/hexpat-streamparser
+
+library
+   Ghc-options: -Wall
+   exposed-modules:
+        Text.XML.Expat.StreamParser
+   hs-source-dirs:
+        src
+   build-depends:
+        base,
+        mtl,
+        List,
+        hexpat,
+        text,
+        parser-combinators,
+        transformers
