@@ -24,4 +24,5 @@ library
         hexpat,
         text,
         parser-combinators,
-        transformers
+        transformers,
+        bytestring
