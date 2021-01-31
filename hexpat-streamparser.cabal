@@ -1,7 +1,7 @@
 cabal-version: 1.12
 name: hexpat-streamparser
 description: streaming xml parser combinators using hexpat
-version: 0.0.1
+version: 0.0.2
 maintainer: kristof@resonata.be
 copyright: Kristof Bastiaensen 2020
 license: BSD3
