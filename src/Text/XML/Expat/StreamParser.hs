@@ -4,6 +4,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE RankNTypes #-}
 
 {-|
 Module      : Text.XML.Expat.StreamParser
@@ -28,7 +30,8 @@ etc...) by providing an instance for `List`.
 module Text.XML.Expat.StreamParser
   (
     -- * Event parser datatype
-    EventParser
+    EventListParser
+  , EventParser
   , EventLoc
   , EventParseError (..)
   , runEventParser
@@ -43,6 +46,7 @@ module Text.XML.Expat.StreamParser
   , peekAttr
   , findAttr
   , skipAttrs
+  , noAttrs
   , -- * Event parsers
     someTag
   , skipTag
@@ -85,7 +89,7 @@ module Text.XML.Expat.StreamParser
 
 import Control.Applicative hiding (many)
 import Control.Monad.Combinators as C
-import Control.Monad.Except hiding (fail, lift)
+import Control.Monad.Error.Class
 import Control.Monad.Fail
 import Control.Monad.State hiding (fail, lift)
 import Control.Monad.Trans (lift)
@@ -99,6 +103,46 @@ import Data.List.Class (ItemM, List, ListItem(..))
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Text.XML.Expat.SAX as Expat
+
+newtype CPSExceptT e m a =
+  CPSExceptT { getCPSExceptT :: forall r. ((e -> m r) -> (a -> m r) -> m r) }
+
+runCPSExceptT :: Applicative m => CPSExceptT e m a -> m (Either e a)
+runCPSExceptT (CPSExceptT f) = f (pure . Left)  (pure . Right)
+{-# INLINE runCPSExceptT #-}
+
+instance Functor (CPSExceptT e m) where
+  fmap f (CPSExceptT g) = CPSExceptT $ \failC successC ->
+    g failC (successC . f)
+  {-# INLINE fmap #-}
+
+instance Monad m => Applicative (CPSExceptT e m) where
+  pure x = CPSExceptT $ \_failC successC -> successC x
+  {-# INLINE pure #-}
+  (<*>) = ap
+  {-# INLINE (<*>) #-}
+
+instance Monad m => Monad (CPSExceptT e m) where
+  CPSExceptT f >>= g = CPSExceptT $ \failC successC ->
+    f failC (\a -> getCPSExceptT (g a) failC successC)
+  {-# INLINE (>>=) #-}
+
+instance Monad m => MonadError e (CPSExceptT e m) where
+  throwError e = CPSExceptT $ \failC _successC -> failC e
+  {-# INLINE throwError #-}
+  catchError (CPSExceptT f) handler =
+    CPSExceptT $ \failC successC ->
+    f (\e -> getCPSExceptT (handler e) failC successC)
+    successC
+  {-# INLINE catchError #-}
+
+instance MonadTrans (CPSExceptT e) where
+  lift m = CPSExceptT $ \_failC successC -> m >>= successC
+  {-# INLINE lift #-}
+
+instance MonadState s m => MonadState s (CPSExceptT e m) where
+  state f = lift $ state f
+  {-# INLINE state #-}
 
 type EventLoc = (SAXEvent Text Text, XMLParseLocation)
 
@@ -142,13 +186,19 @@ instance Semigroup (EventParseError e) where
 instance Monoid (EventParseError e) where
   mempty = Empty
 
+-- | A parser that parses a lazy list of SAX events into a value of
+-- type `a`, or an error of type `@EventParseError@ e`, where `e` is a
+-- custom error type.
+type EventListParser e a = EventParser [] e Identity a
+     
 -- | A parser that parses a stream of SAX events of type @l
 -- `EventLoc`@ into to a value of type @a@ using `m` as the underlying
 -- monad.  l should be an instance of `List`, and m should be equal to
 -- the type instance (@`ItemM` l@).  Custom error messages are
 -- possible using the type e.
 newtype EventParser l e m a = EventParser
-  { getEventParser :: ExceptT (EventParseError e) (StateT (ParserState l) m) a
+  { getEventParser :: CPSExceptT (EventParseError e) (StateT (ParserState l) m)
+                      a
   } deriving (Functor, Applicative, Monad, MonadError (EventParseError e))
 
 -- | Throw an error with a custom type.  If the custom error type
@@ -233,13 +283,13 @@ runEventParser (EventParser parser) events = do
   firstItem <- List.runList events
   let initState = ParserState False (Ordered firstItem)
   do (a, ParserState _ (Ordered item)) <-
-       flip runStateT initState $ runExceptT parser
+       flip runStateT initState $ runCPSExceptT parser
      case a of
        Right res -> pure $ Right res
        Left err -> pure $ Left $ case item of
          Nil -> (err, Nothing)
          (Cons (_, loc) _) -> (err, Just loc)
-     
+
 -- | Parse a lazy bytestring with the given parser.  Evaluating the
 -- result to WHNF will consume the bytestring (as much as needed).
 -- However this function does not close resources, for example a file
@@ -247,21 +297,21 @@ runEventParser (EventParser parser) events = do
 -- a resource, /after/ evaluating to WHNF, or use the streaming
 -- version of this library (hexpat-streamparser-conduit).  For reading
 -- from a file use the `parseXMLFile` function.
-parseXMLByteString :: EventParser [] e Identity a
-                -> Expat.ParseOptions Text Text
-                -> LazyBS.ByteString
-                -> Either (EventParseError e, Maybe XMLParseLocation) a
+parseXMLByteString :: EventListParser e a
+                   -> Expat.ParseOptions Text Text
+                   -> LazyBS.ByteString
+                   -> Either (EventParseError e, Maybe XMLParseLocation) a
 parseXMLByteString parser parseOptions bs =
   runIdentity $ runEventParser parser $ Expat.parseLocations parseOptions bs
 
 -- | Lazily parse an xml file into a value.  This function ensures the
 --  input is consumed and the file handle closed, before returning the
 --  value.
-parseXMLFile :: EventParser [] e Identity a
-          -> Expat.ParseOptions Text Text
-          -> FilePath
-          -> IOMode
-          -> IO (Either (EventParseError e, Maybe XMLParseLocation) a)
+parseXMLFile :: EventListParser e a
+             -> Expat.ParseOptions Text Text
+             -> FilePath
+             -> IOMode
+             -> IO (Either (EventParseError e, Maybe XMLParseLocation) a)
 parseXMLFile parser parseOptions fp mode =
   withFile fp mode $ \h -> do
   bs <- LazyBS.hGetContents h
@@ -365,6 +415,10 @@ peekAttr (AttrParser attrP) =
 skipAttrs :: AttrParser e ()
 skipAttrs = AttrParser $ put []
 
+-- | expect no attributes.  This is the same as `pure ()`
+noAttrs :: AttrParser e ()
+noAttrs = pure ()
+
 -- | Annotate the parser with a name for better parse errors
 (<?>) :: Monad m => EventParser l e m a -> Text -> EventParser l e m a
 parser <?> msg = parser <|> EventParser (throwError $ Expected [msg])
@@ -395,6 +449,7 @@ someTag tagnameTest attrParser inner = EventParser $ do
               throwError $ UnknownAttributes $ map fst attributes
       | otherwise -> throwError ExpectedTag
     Ordered _ -> throwError ExpectedTag
+{-# INLINABLE someTag #-}    
 
 --  UnOrdered [] -> throwError "Unexpected end of input."
 --  UnOrdered lst -> _ 
@@ -409,6 +464,7 @@ someTag tagnameTest attrParser inner = EventParser $ do
 skipTag :: (Monad (ItemM l), List l) => EventParser l e (ItemM l) ()
 skipTag = (someTag (const True) skipAttrs $ const skipTags)
           <?> "Any Tag"
+{-# INLINE skipTag #-}          
 
 -- | Skip remaining tags and text, if any.
 skipTags :: (Monad (ItemM l), List l) => EventParser l e(ItemM l) ()
