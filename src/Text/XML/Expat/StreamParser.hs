@@ -56,7 +56,6 @@ module Text.XML.Expat.StreamParser
   , someEmptyTag
   , emptyTag
   , text
-  , (<?>)
     -- * Re-exports from "Control.Applicative.Combinators"
   ,  (C.<|>)
   , C.optional
@@ -103,6 +102,9 @@ import Data.List.Class (ItemM, List, ListItem(..))
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Text.XML.Expat.SAX as Expat
+import Data.List (nub)
+import Control.Monad.Except
+import Debug.Trace
 
 newtype CPSExceptT e m a =
   CPSExceptT { getCPSExceptT :: forall r. ((e -> m r) -> (a -> m r) -> m r) }
@@ -159,7 +161,7 @@ data EventParseError e =
   UnMatchedTag |
   ExpectedCloseTag |
   XmlError XMLParseError |
-  AttributeNotFound Text |
+  AttributeNotFound (Maybe Text) Text |
   UnknownAttributes [Text]|
   Expected [Text] |
   CustomError e
@@ -172,15 +174,17 @@ data AttrParserError e =
 
 attrErrorToEvent :: AttrParserError e -> EventParseError e
 attrErrorToEvent AttrEmpty = Empty
-attrErrorToEvent (AttrRequired t) = AttributeNotFound t
+attrErrorToEvent (AttrRequired t) = AttributeNotFound Nothing t
 attrErrorToEvent (CustomAttrError e) = CustomError e
 
--- | semigroup instance concatenates Expected values if any, or
--- returns the last error.  Xml parse errors take precedence.
+-- | semigroup instance concatenates Expected tags.
 instance Semigroup (EventParseError e) where
-  XmlError e <> _ = XmlError e
+  e <> Empty = e
   Expected t <> Expected s = Expected $ t ++ s
-  Expected t <> _ = Expected t
+  AttributeNotFound (Just t) _ <> Expected s = Expected $ t: s
+  Expected t <> AttributeNotFound (Just s) _ = Expected $ t ++ [s]
+  AttributeNotFound (Just s) _ <> AttributeNotFound (Just t) _ =
+    Expected $ nub [s, t]
   _ <> e = e
 
 instance Monoid (EventParseError e) where
@@ -197,7 +201,7 @@ type EventListParser e a = EventParser [] e Identity a
 -- the type instance (@`ItemM` l@).  Custom error messages are
 -- possible using the type e.
 newtype EventParser l e m a = EventParser
-  { getEventParser :: CPSExceptT (EventParseError e) (StateT (ParserState l) m)
+  { getEventParser :: ExceptT (EventParseError e) (StateT (ParserState l) m)
                       a
   } deriving (Functor, Applicative, Monad, MonadError (EventParseError e))
 
@@ -243,11 +247,17 @@ setConsumedState newState = EventParser $ do
   put $ ParserState newState stream
   pure oldState
 
+-- combine old and new consumed state
+updateConsumedState :: Monad m => Bool -> EventParser l e m ()
+updateConsumedState oldState = EventParser $ do
+  ParserState newState stream <- get
+  put $ ParserState (oldState || newState) stream
+
 instance Monad m => Alternative (EventParser l e m) where
   EventParser p <|> EventParser q = EventParser $ do
     -- clear consumed state
     oldConsumedState <- getEventParser $ setConsumedState False
-    catchError p $ \err -> do
+    res <- catchError p $ \err -> do
       ParserState pConsumed _ <- get
       if pConsumed
         -- don't backtrack when already consumed some state
@@ -259,8 +269,11 @@ instance Monad m => Alternative (EventParser l e m) where
              else do
              -- if nothing consumed, then reset consumed state and
              -- combine error messages
-             _ <- getEventParser $ setConsumedState oldConsumedState 
+             getEventParser $ updateConsumedState oldConsumedState
              throwError (err <> err2)
+    getEventParser $ updateConsumedState oldConsumedState
+    pure res
+
   empty = EventParser $ throwError Empty
 
 instance Monad m => MonadPlus (EventParser l e m) where
@@ -283,7 +296,7 @@ runEventParser (EventParser parser) events = do
   firstItem <- List.runList events
   let initState = ParserState False (Ordered firstItem)
   do (a, ParserState _ (Ordered item)) <-
-       flip runStateT initState $ runCPSExceptT parser
+       flip runStateT initState $ runExceptT parser
      case a of
        Right res -> pure $ Right res
        Left err -> pure $ Left $ case item of
@@ -307,12 +320,12 @@ parseXMLByteString parser parseOptions bs =
 -- | Lazily parse an xml file into a value.  This function ensures the
 --  input is consumed and the file handle closed, before returning the
 --  value.
-parseXMLFile :: EventListParser e a
-             -> Expat.ParseOptions Text Text
-             -> FilePath
+parseXMLFile :: Expat.ParseOptions Text Text
              -> IOMode
+             -> FilePath
+             -> EventListParser e a
              -> IO (Either (EventParseError e, Maybe XMLParseLocation) a)
-parseXMLFile parser parseOptions fp mode =
+parseXMLFile parseOptions mode fp parser =
   withFile fp mode $ \h -> do
   bs <- LazyBS.hGetContents h
   pure $! parseXMLByteString parser parseOptions bs
@@ -363,7 +376,7 @@ closeTag tagName =
                 StartElement _ _ -> throwError ExpectedCloseTag
                 CharacterData t
                   | not (Text.all (`elem` (" \t\r\n" :: String)) t) ->
-                    error "unexpected text"
+                    throwError ExpectedCloseTag
                 FailDocument err -> do
                   put $ ParserState consumed (Ordered list)
                   throwError $ XmlError err
@@ -419,10 +432,6 @@ skipAttrs = AttrParser $ put []
 noAttrs :: AttrParser e ()
 noAttrs = pure ()
 
--- | Annotate the parser with a name for better parse errors
-(<?>) :: Monad m => EventParser l e m a -> Text -> EventParser l e m a
-parser <?> msg = parser <|> EventParser (throwError $ Expected [msg])
-
 -- | Parse a tag that succeed on the given test function.  Parses the
 -- children in the order or the inner parser.
 someTag :: (Monad (ItemM l), List l)
@@ -462,8 +471,7 @@ someTag tagnameTest attrParser inner = EventParser $ do
 -- someUnorderedTag inner = _
 -- | Skip next tag
 skipTag :: (Monad (ItemM l), List l) => EventParser l e (ItemM l) ()
-skipTag = (someTag (const True) skipAttrs $ const skipTags)
-          <?> "Any Tag"
+skipTag = someTag (const True) skipAttrs $ const skipTags
 {-# INLINE skipTag #-}          
 
 -- | Skip remaining tags and text, if any.
@@ -484,9 +492,13 @@ tag :: (Monad (ItemM l), List l)
     -> AttrParser e b           -- ^ attribute parser
     -> (b -> EventParser l e (ItemM l) a) -- ^ tag children parser
     -> EventParser l e (ItemM l) a
-tag name attrP children = someTag (== name) attrP children
-                          <?> (name <> " Tag")
-
+tag name attrP children =
+  catchError (someTag (== name) attrP children) $ \err ->
+  case err of
+    ExpectedTag -> throwError $ Expected [name]
+    AttributeNotFound _ a -> throwError $ AttributeNotFound (Just name) a
+    _ -> throwError err
+    
 -- -- | Parse a tag with the given name, using the inner parser for the
 -- -- children tags.  The children tags can be in any order.  Note that
 -- -- this is less efficient than an orderedTag, since it has to keep
