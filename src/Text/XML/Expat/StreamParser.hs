@@ -103,8 +103,6 @@ import qualified Data.Text as Text
 import Data.Text (Text)
 import Text.XML.Expat.SAX as Expat
 import Data.List (nub)
-import Control.Monad.Except
-import Debug.Trace
 
 newtype CPSExceptT e m a =
   CPSExceptT { getCPSExceptT :: forall r. ((e -> m r) -> (a -> m r) -> m r) }
@@ -165,12 +163,13 @@ data EventParseError e =
   UnknownAttributes [Text]|
   Expected [Text] |
   CustomError e
-  deriving (Show)
+  deriving (Show, Eq)
 
 data AttrParserError e =
   AttrRequired Text |
   AttrEmpty |
   CustomAttrError e
+  deriving (Show, Eq)
 
 attrErrorToEvent :: AttrParserError e -> EventParseError e
 attrErrorToEvent AttrEmpty = Empty
@@ -201,7 +200,7 @@ type EventListParser e a = EventParser [] e Identity a
 -- the type instance (@`ItemM` l@).  Custom error messages are
 -- possible using the type e.
 newtype EventParser l e m a = EventParser
-  { getEventParser :: ExceptT (EventParseError e) (StateT (ParserState l) m)
+  { getEventParser :: CPSExceptT (EventParseError e) (StateT (ParserState l) m)
                       a
   } deriving (Functor, Applicative, Monad, MonadError (EventParseError e))
 
@@ -296,7 +295,7 @@ runEventParser (EventParser parser) events = do
   firstItem <- List.runList events
   let initState = ParserState False (Ordered firstItem)
   do (a, ParserState _ (Ordered item)) <-
-       flip runStateT initState $ runExceptT parser
+       flip runStateT initState $ runCPSExceptT parser
      case a of
        Right res -> pure $ Right res
        Left err -> pure $ Left $ case item of
@@ -476,7 +475,7 @@ skipTag = someTag (const True) skipAttrs $ const skipTags
 
 -- | Skip remaining tags and text, if any.
 skipTags :: (Monad (ItemM l), List l) => EventParser l e(ItemM l) ()
-skipTags = void $ many (skipTag <|> void text)
+skipTags = optional text >> skipMany (skipTag >> void text)
 
 -- | Skip zero or more tags until the given parser succeeds
 skipTagsTill ::
@@ -496,7 +495,7 @@ tag name attrP children =
   catchError (someTag (== name) attrP children) $ \err ->
   case err of
     ExpectedTag -> throwError $ Expected [name]
-    AttributeNotFound _ a -> throwError $ AttributeNotFound (Just name) a
+    AttributeNotFound Nothing a -> throwError $ AttributeNotFound (Just name) a
     _ -> throwError err
     
 -- -- | Parse a tag with the given name, using the inner parser for the
