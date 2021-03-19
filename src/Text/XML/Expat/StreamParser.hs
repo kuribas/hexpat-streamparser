@@ -159,7 +159,7 @@ data EventParseError e =
   UnMatchedTag |
   ExpectedCloseTag |
   XmlError XMLParseError |
-  AttributeNotFound (Maybe Text) Text |
+  AttributeNotFound Text Text |
   UnknownAttributes [Text]|
   Expected [Text] |
   CustomError e
@@ -171,18 +171,13 @@ data AttrParserError e =
   CustomAttrError e
   deriving (Show, Eq)
 
-attrErrorToEvent :: AttrParserError e -> EventParseError e
-attrErrorToEvent AttrEmpty = Empty
-attrErrorToEvent (AttrRequired t) = AttributeNotFound Nothing t
-attrErrorToEvent (CustomAttrError e) = CustomError e
-
 -- | semigroup instance concatenates Expected tags.
 instance Semigroup (EventParseError e) where
   e <> Empty = e
   Expected t <> Expected s = Expected $ t ++ s
-  AttributeNotFound (Just t) _ <> Expected s = Expected $ t: s
-  Expected t <> AttributeNotFound (Just s) _ = Expected $ t ++ [s]
-  AttributeNotFound (Just s) _ <> AttributeNotFound (Just t) _ =
+  AttributeNotFound t _ <> Expected s = Expected $ t: s
+  Expected t <> AttributeNotFound s _ = Expected $ t ++ [s]
+  AttributeNotFound s _ <> AttributeNotFound t _ =
     Expected $ nub [s, t]
   _ <> e = e
 
@@ -332,8 +327,8 @@ parseXMLFile parseOptions mode fp parser =
 -- skip to next open tag.  Skip whitespace text if any. This doesn't
 -- consume any tags.
 skipToNextTag :: forall l e. (List l, Monad (ItemM l))
-              => EventParser l e (ItemM l) ()
-skipToNextTag =
+              => Maybe Text -> EventParser l e (ItemM l) ()
+skipToNextTag expectedTag =
   EventParser $ do
     ParserState consumed (Ordered firstItem) <- get
     let loop item =
@@ -344,7 +339,9 @@ skipToNextTag =
                 StartElement _ _ -> pure list
                 EndElement _ -> do
                   put $ ParserState consumed (Ordered list)
-                  throwError ExpectedTag
+                  throwError $ case expectedTag of
+                    Nothing -> ExpectedTag
+                    Just t -> Expected [t]
                 CharacterData t
                   | not (Text.all (`elem` (" \t\r\n" :: String)) t) -> pure list
                 FailDocument err -> do
@@ -434,19 +431,32 @@ noAttrs = pure ()
 -- | Parse a tag that succeed on the given test function.  Parses the
 -- children in the order or the inner parser.
 someTag :: (Monad (ItemM l), List l)
-        => (Text -> Bool)     -- ^ tagname test
-        -> AttrParser e b     -- ^ parser for attributes
-        -> (b -> EventParser l e (ItemM l) a) -- ^ parser for tag children
-        -> EventParser l e (ItemM l) a
-someTag tagnameTest attrParser inner = EventParser $ do
-  _ <- getEventParser skipToNextTag
+         => (Text -> Bool)     -- ^ tagname test
+         -> AttrParser e b     -- ^ parser for attributes
+         -> (b -> EventParser l e (ItemM l) a) -- ^ parser for tag children
+         -> EventParser l e (ItemM l) a
+someTag = someTag' Nothing
+
+
+-- | Parse a tag that succeed on the given test function.  Parses the
+-- children in the order or the inner parser.
+someTag' :: (Monad (ItemM l), List l)
+         => Maybe Text
+         -> (Text -> Bool)     -- ^ tagname test
+         -> AttrParser e b     -- ^ parser for attributes
+         -> (b -> EventParser l e (ItemM l) a) -- ^ parser for tag children
+         -> EventParser l e (ItemM l) a
+someTag' expectedName tagnameTest attrParser inner = EventParser $ do
+  _ <- getEventParser $ skipToNextTag expectedName
   ParserState _ elems <- get
   case elems of
     Ordered Nil -> throwError EndOfSaxStream
     Ordered (Cons (StartElement tagName attrs, _loc) next)
       | tagnameTest tagName ->
           case runStateT (runAttrParser attrParser) attrs of
-            Left err -> throwError $ attrErrorToEvent err
+            Left AttrEmpty -> throwError Empty
+            Left (AttrRequired t) -> throwError $ AttributeNotFound tagName t
+            Left (CustomAttrError e) -> throwError $ CustomError e
             Right (attrData, []) -> do
               nextItem <- getEventParser $ lift $ List.runList next
               put $ ParserState True (Ordered nextItem)
@@ -455,8 +465,12 @@ someTag tagnameTest attrParser inner = EventParser $ do
               pure result
             Right (_, attributes) ->
               throwError $ UnknownAttributes $ map fst attributes
-      | otherwise -> throwError ExpectedTag
-    Ordered _ -> throwError ExpectedTag
+      | otherwise -> tagExpectedError
+    Ordered _ -> tagExpectedError
+    where
+      tagExpectedError = throwError $ case expectedName of
+        Nothing -> ExpectedTag
+        Just t -> Expected [t]
 {-# INLINABLE someTag #-}    
 
 --  UnOrdered [] -> throwError "Unexpected end of input."
@@ -492,11 +506,7 @@ tag :: (Monad (ItemM l), List l)
     -> (b -> EventParser l e (ItemM l) a) -- ^ tag children parser
     -> EventParser l e (ItemM l) a
 tag name attrP children =
-  catchError (someTag (== name) attrP children) $ \err ->
-  case err of
-    ExpectedTag -> throwError $ Expected [name]
-    AttributeNotFound Nothing a -> throwError $ AttributeNotFound (Just name) a
-    _ -> throwError err
+  someTag' (Just name) (== name) attrP children
     
 -- -- | Parse a tag with the given name, using the inner parser for the
 -- -- children tags.  The children tags can be in any order.  Note that
@@ -522,7 +532,7 @@ emptyTag :: (Monad (ItemM l), List l)
          => Text                 -- ^ tag name
          -> AttrParser e b       -- ^ attribute parser
          -> EventParser l e (ItemM l) b
-emptyTag name = someEmptyTag (== name)
+emptyTag name attrP = someTag' (Just name) (== name) attrP pure
 
 -- | Parse text.  Note that parsing a tag will skip white space, so if
 -- whitespace is significant, run this parser first.
