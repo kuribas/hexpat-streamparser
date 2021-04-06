@@ -271,7 +271,7 @@ runEventParser (EventParser parser) events = do
 -- However this function does not close resources, for example a file
 -- handle when using `readFile`.  Make sure to always explicitly close
 -- a resource, /after/ evaluating to WHNF, or use the streaming
--- version of this library (hexpat-streamparser-conduit).  For reading
+-- version of this library (hexpat-conduit).  For reading
 -- from a file use the `parseXMLFile` function.
 parseXMLByteString :: EventListParser e a
                    -> Expat.ParseOptions Text Text
