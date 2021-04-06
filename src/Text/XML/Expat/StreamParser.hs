@@ -34,6 +34,7 @@ module Text.XML.Expat.StreamParser
   , EventParser
   , EventLoc
   , EventParseError (..)
+  , mapParser
   , runEventParser
   , customError
   , -- * Running parsers
@@ -89,6 +90,7 @@ module Text.XML.Expat.StreamParser
 import Control.Applicative hiding (many)
 import Control.Monad.Combinators as C
 import Control.Monad.Error.Class
+import Control.Monad.CPSExcept
 import Control.Monad.Fail
 import Control.Monad.State hiding (fail, lift)
 import Control.Monad.Trans (lift)
@@ -103,46 +105,6 @@ import qualified Data.Text as Text
 import Data.Text (Text)
 import Text.XML.Expat.SAX as Expat
 import Data.List (nub)
-
-newtype CPSExceptT e m a =
-  CPSExceptT { getCPSExceptT :: forall r. ((e -> m r) -> (a -> m r) -> m r) }
-
-runCPSExceptT :: Applicative m => CPSExceptT e m a -> m (Either e a)
-runCPSExceptT (CPSExceptT f) = f (pure . Left)  (pure . Right)
-{-# INLINE runCPSExceptT #-}
-
-instance Functor (CPSExceptT e m) where
-  fmap f (CPSExceptT g) = CPSExceptT $ \failC successC ->
-    g failC (successC . f)
-  {-# INLINE fmap #-}
-
-instance Monad m => Applicative (CPSExceptT e m) where
-  pure x = CPSExceptT $ \_failC successC -> successC x
-  {-# INLINE pure #-}
-  (<*>) = ap
-  {-# INLINE (<*>) #-}
-
-instance Monad m => Monad (CPSExceptT e m) where
-  CPSExceptT f >>= g = CPSExceptT $ \failC successC ->
-    f failC (\a -> getCPSExceptT (g a) failC successC)
-  {-# INLINE (>>=) #-}
-
-instance Monad m => MonadError e (CPSExceptT e m) where
-  throwError e = CPSExceptT $ \failC _successC -> failC e
-  {-# INLINE throwError #-}
-  catchError (CPSExceptT f) handler =
-    CPSExceptT $ \failC successC ->
-    f (\e -> getCPSExceptT (handler e) failC successC)
-    successC
-  {-# INLINE catchError #-}
-
-instance MonadTrans (CPSExceptT e) where
-  lift m = CPSExceptT $ \_failC successC -> m >>= successC
-  {-# INLINE lift #-}
-
-instance MonadState s m => MonadState s (CPSExceptT e m) where
-  state f = lift $ state f
-  {-# INLINE state #-}
 
 type EventLoc = (SAXEvent Text Text, XMLParseLocation)
 
@@ -198,6 +160,13 @@ newtype EventParser l e m a = EventParser
   { getEventParser :: CPSExceptT (EventParseError e) (StateT (ParserState l) m)
                       a
   } deriving (Functor, Applicative, Monad, MonadError (EventParseError e))
+
+-- | Change the base monad of a parser
+mapParser :: (Monad m, Monad n)
+          => (forall b . m b -> n b)
+          -> EventParser l e m a -> EventParser l e n a
+mapParser tr (EventParser parser) =
+  EventParser $ mapCPSExceptT (mapStateT tr) parser
 
 -- | Throw an error with a custom type.  If the custom error type
 -- provides an `IsString` instance, you can also use `fail` (for example
